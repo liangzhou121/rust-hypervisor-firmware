@@ -5,7 +5,9 @@ use heapless::Vec;
 use r_efi::efi;
 
 const MAX_VAR_NAME: usize = 64;
-const MAX_VAR_DATA: usize = 1024;
+// shim's mirrored MokListRT variable (a dummy cert when no MOK is enrolled)
+// is just over 1024 bytes, so give some headroom above that.
+const MAX_VAR_DATA: usize = 4096;
 const MAX_VAR_NUM: usize = 128;
 
 #[derive(Debug)]

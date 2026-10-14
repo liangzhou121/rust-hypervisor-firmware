@@ -267,10 +267,22 @@ pub extern "efiapi" fn query_variable_info(
     remaining_storage: *mut u64,
     max_size: *mut u64,
 ) -> Status {
-    unsafe {
-        *max_storage = 0;
-        *remaining_storage = 0;
-        *max_size = 0;
+    if cfg!(feature = "efi-var") {
+        // Report generous but plausible capacity backed by our in-memory
+        // variable store (see var.rs), rather than UNSUPPORTED/all-zero:
+        // OVMF's real variable store does the same, and shim/GRUB code
+        // paths that depend on a successful query (e.g. mirroring MOK
+        // variables) take a different, more direct route when this
+        // succeeds instead of falling back to slower probing.
+        const TOTAL_STORAGE: u64 = 128 * 4096;
+        const MAX_VAR_SIZE: u64 = 4096;
+        unsafe {
+            *max_storage = TOTAL_STORAGE;
+            *remaining_storage = TOTAL_STORAGE;
+            *max_size = MAX_VAR_SIZE;
+        }
+        Status::SUCCESS
+    } else {
+        Status::UNSUPPORTED
     }
-    Status::SUCCESS
 }

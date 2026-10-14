@@ -6,21 +6,22 @@
 
 use core::fmt;
 
+#[cfg(not(all(target_arch = "x86_64", feature = "td-shim")))]
 use atomic_refcell::AtomicRefCell;
 
 #[cfg(target_arch = "aarch64")]
 use crate::{arch::aarch64::layout::map, uart_pl011::Pl011 as UartPl011};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 use uart_16550::{backend::PioBackend, spec::registers::IER, BaudRate, Config, Uart16550Tty};
 
 #[cfg(target_arch = "riscv64")]
 use crate::uart_mmio::UartMmio;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 static PORT: AtomicRefCell<Option<Uart16550Tty<PioBackend>>> = AtomicRefCell::new(None);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 pub fn init() {
     let config = Config {
         baud_rate: BaudRate::Baud38400,
@@ -31,6 +32,35 @@ pub fn init() {
     let port = unsafe { Uart16550Tty::new_port(0x3f8, config) }
         .expect("Failed to initialize the serial port");
     *PORT.borrow_mut() = Some(port);
+}
+
+// Raw port I/O traps inside a TDX guest (and td-shim's temporary exception
+// handler treats any trap as fatal), so talk to the debug port via TDVMCALL
+// instead, the same way td-payload's serial.rs does. The virtual UART
+// doesn't need the usual 16550 line-control/baud-rate setup to accept bytes.
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+const SERIAL_IO_PORT: u16 = 0x3f8;
+
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+pub fn init() {}
+
+// Non-blocking: returns the next received byte, or None if none is waiting.
+// Only implemented for the td-shim (TDVMCALL) path so far.
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+pub fn read_byte() -> Option<u8> {
+    const LSR_PORT: u16 = 0x3fd;
+    const LSR_DATA_READY: u8 = 1;
+
+    if tdx_tdcall::tdx::tdvmcall_io_read_8(LSR_PORT) & LSR_DATA_READY != 0 {
+        Some(tdx_tdcall::tdx::tdvmcall_io_read_8(SERIAL_IO_PORT))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "td-shim")))]
+pub fn read_byte() -> Option<u8> {
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -46,16 +76,25 @@ pub static PORT: AtomicRefCell<UartMmio> = AtomicRefCell::new(UartMmio::new(SERI
 pub struct Serial;
 impl fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
         {
             // Initialization can panic before the port is available for logging.
             if let Some(port) = PORT.borrow_mut().as_mut() {
                 port.write_str(s)?;
             }
-            Ok(())
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+        {
+            for b in s.bytes() {
+                if b == b'\n' {
+                    tdx_tdcall::tdx::tdvmcall_io_write_8(SERIAL_IO_PORT, b'\r');
+                }
+                tdx_tdcall::tdx::tdvmcall_io_write_8(SERIAL_IO_PORT, b);
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
-        PORT.borrow_mut().write_str(s)
+        PORT.borrow_mut().write_str(s)?;
+        Ok(())
     }
 }
 

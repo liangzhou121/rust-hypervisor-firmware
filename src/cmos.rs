@@ -2,17 +2,27 @@
 // Copyright (C) 2021 Akira Moroo
 
 use atomic_refcell::AtomicRefCell;
+#[cfg(not(feature = "td-shim"))]
 use x86_64::instructions::port::{Port, PortWriteOnly};
 
 static CMOS: AtomicRefCell<Cmos> = AtomicRefCell::new(Cmos::new());
 
+#[cfg(not(feature = "td-shim"))]
 struct Cmos {
     address_port: PortWriteOnly<u8>,
     data_port: Port<u8>,
     reg_b: Option<u8>,
 }
 
+// Raw port I/O traps inside a TDX guest, so talk to the RTC ports via
+// TDVMCALL instead; there is no persistent port state to hold onto.
+#[cfg(feature = "td-shim")]
+struct Cmos {
+    reg_b: Option<u8>,
+}
+
 impl Cmos {
+    #[cfg(not(feature = "td-shim"))]
     const fn new() -> Self {
         Self {
             address_port: PortWriteOnly::new(0x70),
@@ -21,12 +31,25 @@ impl Cmos {
         }
     }
 
+    #[cfg(feature = "td-shim")]
+    const fn new() -> Self {
+        Self { reg_b: None }
+    }
+
+    #[cfg(not(feature = "td-shim"))]
     fn read_cmos(&mut self, addr: u8) -> u8 {
         assert!(addr < 128);
         unsafe {
             self.address_port.write(addr);
             self.data_port.read()
         }
+    }
+
+    #[cfg(feature = "td-shim")]
+    fn read_cmos(&mut self, addr: u8) -> u8 {
+        assert!(addr < 128);
+        tdx_tdcall::tdx::tdvmcall_io_write_8(0x70, addr);
+        tdx_tdcall::tdx::tdvmcall_io_read_8(0x71)
     }
 
     fn get_update_status(&mut self) -> bool {

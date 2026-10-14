@@ -30,7 +30,7 @@ use var::VariableAllocator;
 #[cfg(target_arch = "aarch64")]
 pub const EFI_BOOT_PATH: &str = "\\EFI\\BOOT\\BOOTAA64.EFI";
 #[cfg(target_arch = "x86_64")]
-pub const EFI_BOOT_PATH: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
+pub const EFI_BOOT_PATH: &str = "\\EFI\\ubuntu\\shimx64.efi";
 #[cfg(target_arch = "riscv64")]
 pub const EFI_BOOT_PATH: &str = "\\EFI\\BOOT\\BOOTRISCV64.EFI";
 
@@ -86,21 +86,52 @@ static mut BLOCK_WRAPPERS: SyncUnsafeCell<block::BlockWrappers> =
     });
 
 // Populate allocator from E820, fixed ranges for the firmware and the loaded binary.
+// Carves `[address, address + page_count * PAGE_SIZE)` out of the
+// allocator's memory map as `memory_type`. Under td-shim, our own firmware
+// image (and the loaded payload) lives in memory e820 reports as something
+// other than `Ram` (e.g. `Reserved`), so unlike PVH boot it isn't already
+// tracked as conventional memory; seed it first if the straightforward
+// carve-out fails, so this range isn't just silently missing from the EFI
+// memory map we report to the OS.
+fn allocate_address_with_fallback(memory_type: efi::MemoryType, page_count: u64, address: u64) {
+    let status = ALLOCATOR
+        .borrow_mut()
+        .allocate_pages(efi::ALLOCATE_ADDRESS, memory_type, page_count, address)
+        .0;
+    if status == Status::SUCCESS {
+        return;
+    }
+
+    ALLOCATOR.borrow_mut().add_initial_allocation(
+        efi::CONVENTIONAL_MEMORY,
+        page_count,
+        address,
+        efi::MEMORY_WB,
+    );
+    ALLOCATOR
+        .borrow_mut()
+        .allocate_pages(efi::ALLOCATE_ADDRESS, memory_type, page_count, address);
+}
+
 fn populate_allocator(info: &dyn bootinfo::Info, image_address: u64, image_size: u64) {
     for i in 0..info.num_entries() {
         let entry = info.entry(i);
-        match entry.entry_type {
-            bootinfo::EntryType::Ram => {
-                let page_count = ALLOCATOR.borrow().page_count(entry.size as usize);
-                ALLOCATOR.borrow_mut().add_initial_allocation(
-                    efi::CONVENTIONAL_MEMORY,
-                    page_count,
-                    entry.addr,
-                    efi::MEMORY_WB,
-                );
-            }
+        // ACPI ranges must stay in the memory map: in a TDX guest the OS maps
+        // memory with no description as shared, which would turn the
+        // (private) ACPI tables and event log into ciphertext.
+        let memory_type = match entry.entry_type {
+            bootinfo::EntryType::Ram => efi::CONVENTIONAL_MEMORY,
+            bootinfo::EntryType::AcpiReclaimable => efi::ACPI_RECLAIM_MEMORY,
+            bootinfo::EntryType::AcpiNvs => efi::ACPI_MEMORY_NVS,
             _ => continue,
-        }
+        };
+        let page_count = ALLOCATOR.borrow().page_count(entry.size as usize);
+        ALLOCATOR.borrow_mut().add_initial_allocation(
+            memory_type,
+            page_count,
+            entry.addr,
+            efi::MEMORY_WB,
+        );
     }
 
     for descriptor in info.memory_layout() {
@@ -110,8 +141,7 @@ fn populate_allocator(info: &dyn bootinfo::Info, image_address: u64, image_size:
             layout::MemoryAttribute::Unusable => efi::UNUSABLE_MEMORY,
             layout::MemoryAttribute::Mmio => efi::MEMORY_MAPPED_IO,
         };
-        ALLOCATOR.borrow_mut().allocate_pages(
-            efi::ALLOCATE_ADDRESS,
+        allocate_address_with_fallback(
             memory_type,
             descriptor.page_count() as u64,
             descriptor.range_start() as u64,
@@ -120,22 +150,12 @@ fn populate_allocator(info: &dyn bootinfo::Info, image_address: u64, image_size:
 
     if let Some(fdt_entry) = info.fdt_reservation() {
         let page_count = ALLOCATOR.borrow().page_count(fdt_entry.size as usize);
-        ALLOCATOR.borrow_mut().allocate_pages(
-            efi::ALLOCATE_ADDRESS,
-            efi::UNUSABLE_MEMORY,
-            page_count,
-            fdt_entry.addr,
-        );
+        allocate_address_with_fallback(efi::UNUSABLE_MEMORY, page_count, fdt_entry.addr);
     }
 
     // Add the loaded binary
     let page_count = ALLOCATOR.borrow().page_count(image_size as usize);
-    ALLOCATOR.borrow_mut().allocate_pages(
-        efi::ALLOCATE_ADDRESS,
-        efi::LOADER_CODE,
-        page_count,
-        image_address,
-    );
+    allocate_address_with_fallback(efi::LOADER_CODE, page_count, image_address);
 }
 
 #[repr(C)]
@@ -152,6 +172,7 @@ fn new_image_handle(
     load_addr: u64,
     load_size: u64,
     entry_addr: u64,
+    load_options: Option<(*mut c_void, u32)>,
 ) -> *mut LoadedImageWrapper {
     let mut image = null_mut();
     let status = boot_services::allocate_pool(
@@ -161,6 +182,7 @@ fn new_image_handle(
     );
     assert!(status == Status::SUCCESS);
     let image = unsafe { &mut *(image as *mut LoadedImageWrapper) };
+    let (load_options, load_options_size) = load_options.unwrap_or((null_mut(), 0));
     *image = LoadedImageWrapper {
         hw: HandleWrapper {
             handle_type: HandleType::LoadedImage,
@@ -172,8 +194,8 @@ fn new_image_handle(
             system_table: unsafe { ST.get_mut() },
             device_handle,
             file_path,
-            load_options_size: 0,
-            load_options: null_mut(),
+            load_options_size,
+            load_options,
             image_base: load_addr as *mut _,
             image_size: load_size,
             image_code_type: efi::LOADER_CODE,
@@ -193,6 +215,7 @@ pub fn efi_exec(
     info: &dyn bootinfo::Info,
     fs: &crate::fat::Filesystem,
     block: &crate::block::VirtioBlockDevice,
+    load_options: Option<(*mut c_void, u32)>,
 ) {
     let vendor_data = 0u32;
 
@@ -285,6 +308,7 @@ pub fn efi_exec(
         loaded_address,
         loaded_size,
         address,
+        load_options,
     );
 
     let ptr = address as *const ();

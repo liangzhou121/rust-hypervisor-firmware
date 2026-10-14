@@ -17,6 +17,12 @@ pub trait Info {
     }
     // The kernel command line (not including null terminator)
     fn cmdline(&self) -> &[u8];
+    // Address and command line of a kernel the VMM supplied directly (e.g.
+    // cloud-hypervisor's `--kernel`/`--cmdline`) for us to boot ourselves,
+    // instead of searching a disk for a bootloader.
+    fn kernel_payload(&self) -> Option<(u64, &'static [u8])> {
+        None
+    }
     // Methods to access the Memory map
     fn num_entries(&self) -> usize;
     fn entry(&self, idx: usize) -> MemoryEntry;

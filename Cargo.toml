@@ -24,6 +24,14 @@ log-panic = ["log-serial"]
 integration_tests = []
 coreboot = []
 efi-var = []
+# Boot as an "executable" payload loaded by td-shim
+# (https://github.com/confidential-containers/td-shim) instead of via PVH/
+# coreboot. Build with --target x86_64-unknown-none-tdshim.json when using
+# this feature; see src/tdshim.rs. Raw port I/O traps inside a TDX guest, so
+# this also switches serial/PCI/CMOS to use TDVMCALL (see tdx-tdcall dep),
+# and installs a real #VE handler (see td-exception dep) since GRUB/shim's
+# own code does raw port I/O we cannot patch.
+td-shim = ["dep:tdx-tdcall", "dep:td-exception"]
 
 [dependencies]
 bitflags = "2.13.0"
@@ -43,6 +51,8 @@ uart_16550 = "0.8.0"
 x86_64 = { version = "0.15.4", default-features = false, features = [
     "instructions",
 ] }
+tdx-tdcall = { path = "../td-shim/tdx-tdcall", optional = true }
+td-exception = { path = "../td-shim/td-exception", features = ["tdx"], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 chrono = { version = "0.4", default-features = false }

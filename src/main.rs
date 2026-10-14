@@ -16,7 +16,7 @@
 #[cfg(all(not(test), not(feature = "integration_tests")))]
 use core::panic::PanicInfo;
 
-use log::{error, info, warn};
+use log::{error, info, trace, warn};
 #[cfg(all(
     not(test),
     not(feature = "integration_tests"),
@@ -57,13 +57,19 @@ mod mem;
 mod part;
 mod pci;
 mod pe;
-#[cfg(all(target_arch = "x86_64", not(feature = "coreboot")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "coreboot"),
+    not(feature = "td-shim")
+))]
 mod pvh;
 mod rtc;
 #[cfg(target_arch = "riscv64")]
 mod rtc_goldfish;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+mod tdshim;
 #[cfg(target_arch = "riscv64")]
 mod uart_mmio;
 #[cfg(target_arch = "aarch64")]
@@ -104,6 +110,112 @@ enum Error {
     ImageTooLarge,
 }
 
+// Lets `pe::Loader` read an in-memory kernel image (already placed there by
+// the VMM, e.g. cloud-hypervisor's `--kernel`) the same way it reads a file
+// from the FAT filesystem.
+#[cfg(feature = "td-shim")]
+struct MemoryFileReader {
+    base: u64,
+    size: u64,
+    position: u64,
+}
+
+#[cfg(feature = "td-shim")]
+impl fat::Read for MemoryFileReader {
+    fn read(&mut self, data: &mut [u8]) -> Result<u32, fat::Error> {
+        if self.position + data.len() as u64 > self.size {
+            return Err(fat::Error::EndOfFile);
+        }
+        let src = unsafe {
+            core::slice::from_raw_parts((self.base + self.position) as *const u8, data.len())
+        };
+        data.copy_from_slice(src);
+        self.position += data.len() as u64;
+        Ok(data.len() as u32)
+    }
+
+    fn seek(&mut self, offset: u32) -> Result<(), fat::Error> {
+        if offset as u64 > self.size {
+            return Err(fat::Error::InvalidOffset);
+        }
+        self.position = offset as u64;
+        Ok(())
+    }
+
+    fn get_size(&self) -> u32 {
+        self.size as u32
+    }
+}
+
+// Converts an ASCII/UTF-8 NUL-terminated-or-not command line into a NUL
+// terminated UTF-16 buffer suitable for EFI_LOADED_IMAGE_PROTOCOL's
+// LoadOptions, which is how a Linux kernel's EFI stub receives its command
+// line when launched directly (as opposed to via a bootloader).
+#[cfg(feature = "td-shim")]
+fn cmdline_to_load_options(cmdline: &[u8], buf: &mut [u16]) -> (*mut core::ffi::c_void, u32) {
+    let len = cmdline.len().min(buf.len() - 1);
+    for (i, &b) in cmdline[..len].iter().enumerate() {
+        buf[i] = b as u16;
+    }
+    buf[len] = 0;
+    (
+        buf.as_mut_ptr() as *mut core::ffi::c_void,
+        ((len + 1) * size_of::<u16>()) as u32,
+    )
+}
+
+// Boots a kernel the VMM placed directly in memory (e.g. cloud-hypervisor's
+// `--kernel`/`--cmdline`) via its own EFI stub, instead of searching the
+// disk for a bootloader. This still gives the kernel full EFI boot/runtime
+// services, same as the usual disk-based boot path below, just without
+// going through GRUB/shim first.
+#[cfg(feature = "td-shim")]
+fn boot_external_kernel(
+    device: &block::VirtioBlockDevice,
+    f: &fat::Filesystem,
+    info: &dyn bootinfo::Info,
+    kernel_addr: u64,
+    cmdline: &[u8],
+) -> Result<(), Error> {
+    info!("Booting VMM-supplied kernel directly via its EFI stub");
+
+    let mut reader = MemoryFileReader {
+        base: kernel_addr,
+        size: tdshim::KERNEL_PAYLOAD_SIZE,
+        position: 0,
+    };
+    let mut l = pe::Loader::new(&mut reader);
+
+    // Relocate/load the kernel's own PE image just past the end of the
+    // reserved region its raw (compressed) bytes are being read from above,
+    // rather than at the usual `kernel_load_addr()` (used by the on-disk
+    // bootloader path below): that address can overlap this source region
+    // for a sufficiently large kernel, corrupting it mid-copy.
+    let load_addr_hint = kernel_addr + tdshim::KERNEL_PAYLOAD_SIZE;
+    let (entry_addr, load_addr, size) = match l.load(load_addr_hint) {
+        Ok(load_info) => load_info,
+        Err(err) => {
+            error!("Error loading kernel EFI stub: {err:?}");
+            return Err(Error::Pe(err));
+        }
+    };
+    info!("Kernel EFI stub loaded");
+
+    let mut load_options_buf = [0u16; 512];
+    let load_options = cmdline_to_load_options(cmdline, &mut load_options_buf);
+
+    efi::efi_exec(
+        entry_addr,
+        load_addr,
+        size,
+        info,
+        f,
+        device,
+        Some(load_options),
+    );
+    Ok(())
+}
+
 fn boot_from_device(
     device: &mut block::VirtioBlockDevice,
     info: &dyn bootinfo::Info,
@@ -132,6 +244,11 @@ fn boot_from_device(
         return Err(Error::Fat(err));
     }
     info!("Filesystem ready");
+
+    #[cfg(feature = "td-shim")]
+    if let Some((kernel_addr, cmdline)) = info.kernel_payload() {
+        return boot_external_kernel(device, &f, info, kernel_addr, cmdline);
+    }
 
     match loader::load_default_entry(&f, info) {
         Ok(mut kernel) => {
@@ -173,11 +290,11 @@ fn boot_from_device(
     }
 
     info!("Executable loaded");
-    efi::efi_exec(entry_addr, load_addr, size, info, &f, device);
+    efi::efi_exec(entry_addr, load_addr, size, info, &f, device, None);
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 #[no_mangle]
 pub extern "C" fn rust64_start(#[cfg(not(feature = "coreboot"))] pvh_info: &pvh::StartInfo) -> ! {
     serial::init();
@@ -194,6 +311,56 @@ pub extern "C" fn rust64_start(#[cfg(not(feature = "coreboot"))] pvh_info: &pvh:
     let info = pvh_info;
 
     main(info)
+}
+
+// Entry point used when loaded as an "executable" payload by td-shim
+// (https://github.com/confidential-containers/td-shim). Unlike the PVH/
+// coreboot paths above, td-shim jumps here directly in 64-bit long mode with
+// paging already enabled, passing the HOB list address in RDI and this
+// image's own load address in RSI (see tdshim.rs). There is no stack set up
+// for us, so the first thing we do is switch to our own.
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+#[no_mangle]
+pub extern "C" fn _start(hob_address: u64, _payload_address: u64) -> ! {
+    let new_sp = arch::x86_64::layout::stack_range().end as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {sp}",
+            "mov rdi, {hob}",
+            "jmp {entry}",
+            sp = in(reg) new_sp,
+            hob = in(reg) hob_address,
+            entry = sym tdshim_start,
+            options(noreturn),
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+extern "C" fn tdshim_start(hob_address: u64) -> ! {
+    serial::init();
+    logger::init();
+
+    arch::x86_64::sse::enable_sse();
+    arch::x86_64::paging::setup();
+
+    // td-shim's own temporary IDT (installed before jumping here) halts
+    // fatally on any exception, including #VE; GRUB/shim do raw port I/O
+    // we can't patch, so install a real handler that emulates it via
+    // TDVMCALL instead of just trapping.
+    td_exception::setup_exception_handlers();
+
+    // GRUB/Linux both have fallback delay/calibration loops that busy-poll
+    // the (here, non-functional) legacy PIT, bounded only by a background
+    // timer tick; without any interrupt source at all those loops never
+    // give up. Give them a real periodic LAPIC timer, like real firmware
+    // (e.g. OVMF's LocalApicTimerDxe) provides from early boot onward.
+    arch::x86_64::apic::setup_periodic_timer();
+
+    // Safety: td-shim passes a valid HOB list address in RDI.
+    let info = unsafe { tdshim::StartInfo::new(hob_address) };
+
+    main(&info)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -271,15 +438,19 @@ fn main(info: &dyn bootinfo::Info) -> ! {
         VIRTIO_PCI_VENDOR_ID,
         VIRTIO_PCI_BLOCK_DEVICE_ID,
         |mut pci_device| {
+            trace!("main: calling pci_device.init");
             pci_device.init();
+            trace!("main: pci_device.init done, calling allocate_bars");
 
             next_address = pci_device.allocate_bars(next_address);
+            trace!("main: allocate_bars done, next_address={:x?}", next_address);
             if next_address > max_address {
                 panic!("PCI BAR allocation space exceeded")
             }
 
             let mut pci_transport = pci::VirtioPciTransport::new(pci_device);
             let mut device = block::VirtioBlockDevice::new(&mut pci_transport);
+            trace!("main: calling boot_from_device");
             boot_from_device(&mut device, info).is_ok()
         },
     );

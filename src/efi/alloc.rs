@@ -201,6 +201,13 @@ impl Allocator {
             .map(|dest| self.allocations[dest].descriptor.physical_start)
     }
 
+    fn runtime_attribute(memory_type: MemoryType) -> u64 {
+        match memory_type {
+            efi::RUNTIME_SERVICES_CODE | efi::RUNTIME_SERVICES_DATA => r_efi::efi::MEMORY_RUNTIME,
+            _ => 0,
+        }
+    }
+
     pub fn allocate_pages(
         &mut self,
         allocate_type: AllocateType,
@@ -221,6 +228,7 @@ impl Allocator {
         // Identical special case
         if self.allocations[dest].descriptor.number_of_pages == page_count {
             self.allocations[dest].descriptor.r#type = memory_type;
+            self.allocations[dest].descriptor.attribute |= Self::runtime_attribute(memory_type);
             return (
                 Status::SUCCESS,
                 self.allocations[dest].descriptor.physical_start,
@@ -275,10 +283,7 @@ impl Allocator {
         }
 
         self.allocations[assigned].descriptor.r#type = memory_type;
-        self.allocations[assigned].descriptor.attribute |= match memory_type {
-            efi::RUNTIME_SERVICES_CODE | efi::RUNTIME_SERVICES_DATA => r_efi::efi::MEMORY_RUNTIME,
-            _ => 0,
-        };
+        self.allocations[assigned].descriptor.attribute |= Self::runtime_attribute(memory_type);
 
         (
             Status::SUCCESS,

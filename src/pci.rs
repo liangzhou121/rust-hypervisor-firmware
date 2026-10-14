@@ -3,8 +3,8 @@
 
 use atomic_refcell::AtomicRefCell;
 
-use log::{info, warn};
-#[cfg(target_arch = "x86_64")]
+use log::{info, trace, warn};
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 use x86_64::instructions::port::{Port, PortWriteOnly};
 
 use crate::{
@@ -25,11 +25,16 @@ struct PciConfig {
     region: Option<mem::MemoryRegion>,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
 struct PciConfig {
     address_port: PortWriteOnly<u32>,
     data_port: Port<u32>,
 }
+
+// Raw port I/O traps inside a TDX guest, so talk to the legacy CAM ports via
+// TDVMCALL instead; there is no persistent port state to hold onto.
+#[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+struct PciConfig;
 
 impl PciConfig {
     #[cfg(not(target_arch = "x86_64"))]
@@ -38,13 +43,18 @@ impl PciConfig {
         Self { region: None }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
     const fn new() -> Self {
         // We use the legacy, port-based Configuration Access Mechanism (CAM).
         Self {
             address_port: PortWriteOnly::new(0xcf8),
             data_port: Port::new(0xcfc),
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+    const fn new() -> Self {
+        Self
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -60,7 +70,7 @@ impl PciConfig {
             .io_read_u32(addr as u64)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
     fn read_at(&mut self, addr: u32) -> u32 {
         let addr = addr | 1u32 << 31; // enable bit 31
 
@@ -72,6 +82,17 @@ impl PciConfig {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+    fn read_at(&mut self, addr: u32) -> u32 {
+        let addr = addr | 1u32 << 31; // enable bit 31
+
+        trace!("PciConfig::read_at: addr=0x{:x}", addr);
+        tdx_tdcall::tdx::tdvmcall_io_write_32(0xcf8, addr);
+        let value = tdx_tdcall::tdx::tdvmcall_io_read_32(0xcfc);
+        trace!("PciConfig::read_at: addr=0x{:x} value=0x{:x}", addr, value);
+        value
+    }
+
     #[cfg(not(target_arch = "x86_64"))]
     fn write_at(&mut self, addr: u32, value: u32) {
         self.region
@@ -80,7 +101,7 @@ impl PciConfig {
             .io_write_u32(addr as u64, value)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "td-shim")))]
     fn write_at(&mut self, addr: u32, value: u32) {
         let addr = addr | 1u32 << 31; // enable bit 31
 
@@ -90,6 +111,16 @@ impl PciConfig {
             self.address_port.write(addr);
             self.data_port.write(value);
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "td-shim"))]
+    fn write_at(&mut self, addr: u32, value: u32) {
+        let addr = addr | 1u32 << 31; // enable bit 31
+
+        trace!("PciConfig::write_at: addr=0x{:x} value=0x{:x}", addr, value);
+        tdx_tdcall::tdx::tdvmcall_io_write_32(0xcf8, addr);
+        tdx_tdcall::tdx::tdvmcall_io_write_32(0xcfc, value);
+        trace!("PciConfig::write_at: done");
     }
 
     // This is the logic for calculating I/O port address
@@ -252,14 +283,18 @@ impl PciDevice {
             self.bus, self.device, self.func, self.vendor_id, self.device_id
         );
 
-        // Enable responses in memory space
-        self.write_u32(0x4, self.read_u32(0x4) | 0x2);
-
+        // Memory space decoding is left disabled until allocate_bars() has
+        // assigned final addresses (see there) -- enabling it here, before
+        // BAR sizing, makes the transient all-1s probe values look like a
+        // live BAR move to QEMU, which can abort a TDX guest when the probed
+        // address aliases an existing non-guest_memfd-backed region (e.g.
+        // the firmware flash area at the top of 4GiB).
         let mut current_bar_offset = 0x10;
         let mut current_bar = 0;
 
         //0x24 offset is last bar
         while current_bar_offset <= 0x24 {
+            trace!("PciDevice::init: probing bar {} at offset 0x{:x}", current_bar, current_bar_offset);
             #[allow(clippy::disallowed_names)]
             let bar = self.read_u32(current_bar_offset);
 
@@ -314,6 +349,7 @@ impl PciDevice {
                 }
             }
 
+            trace!("PciDevice::init: bar {} probed, type={:?}", current_bar, self.bars[current_bar].bar_type);
             current_bar += 1;
             current_bar_offset += 4;
         }
@@ -325,9 +361,11 @@ impl PciDevice {
                 bar.bar_type, bar.address, bar.size
             );
         }
+        trace!("PciDevice::init: done");
     }
 
     pub fn allocate_bars(&mut self, start_address: Option<u64>) -> Option<u64> {
+        trace!("PciDevice::allocate_bars: start_address={:x?}", start_address);
         let mut next_address = start_address;
 
         let mut current_bar_offset = 0x10;
@@ -342,12 +380,14 @@ impl PciDevice {
                         PciBarType::IoSpace | PciBarType::Unused => {}
                         PciBarType::MemorySpace32 => {
                             let address = naturally_align(*next_address, bar.size);
+                            trace!("PciDevice::allocate_bars: bar {} (32-bit) -> address=0x{:x}", current_bar, address);
                             self.write_u32(current_bar_offset, (address).try_into().unwrap());
                             self.bars[current_bar].address = address;
                             *next_address = address + bar.size;
                         }
                         PciBarType::MemorySpace64 => {
                             let address = naturally_align(*next_address, bar.size);
+                            trace!("PciDevice::allocate_bars: bar {} (64-bit) -> address=0x{:x}", current_bar, address);
                             self.write_u32(
                                 current_bar_offset,
                                 (address & 0xffff_ffff).try_into().unwrap(),
@@ -358,7 +398,7 @@ impl PciDevice {
                             *next_address = address + bar.size;
                         }
                     }
-                } else {
+                }  else {
                     panic!("Zero BAR address and no allocation available to allocate from")
                 }
             }
@@ -374,6 +414,16 @@ impl PciDevice {
                 bar.bar_type, bar.address, bar.size
             );
         }
+
+        // Now that all BARs have their final addresses, it's safe to enable
+        // memory space decoding (see the comment in init()). Also enable bus
+        // mastering (command register bit 2): without it, the device's DMA
+        // address space (PCI "bus master" AS) stays disabled/empty, so it
+        // can never actually read/write the virtqueue or any other guest
+        // memory, even though plain register (non-DMA) MMIO still works.
+        trace!("PciDevice::allocate_bars: enabling memory space responses and bus mastering");
+        self.write_u32(0x4, self.read_u32(0x4) | 0x6);
+        trace!("PciDevice::allocate_bars: done, next_address={:x?}", next_address);
 
         next_address
     }
@@ -427,6 +477,7 @@ impl VirtioPciTransport {
 /// le64 queue_used;                // 0x30 // read-write
 impl VirtioTransport for VirtioPciTransport {
     fn init(&mut self, _device_type: u32) -> Result<(), VirtioError> {
+        trace!("VirtioPciTransport::init: start");
         // Read status register
         let status = self.device.read_u16(0x06);
 
@@ -440,6 +491,7 @@ impl VirtioTransport for VirtioPciTransport {
         let mut cap_next = self.device.read_u8(0x34);
 
         while cap_next < 0xff && cap_next > 0 {
+            trace!("VirtioPciTransport::init: cap_next=0x{:x}", cap_next);
             // vendor specific capability
             if self.device.read_u8(cap_next) == 0x09 {
                 // These offsets are into the following structure:
@@ -458,12 +510,17 @@ impl VirtioTransport for VirtioPciTransport {
                 let bar = self.device.read_u8(cap_next + 4);
                 let offset = self.device.read_u32(cap_next + 8);
                 let length = self.device.read_u32(cap_next + 12);
+                trace!(
+                    "VirtioPciTransport::init: cfg_type={} bar={} offset=0x{:x} length=0x{:x}",
+                    cfg_type, bar, offset, length
+                );
 
                 if cfg_type == VirtioPciCapabilityType::CommonConfig as u8 {
                     self.region = mem::MemoryRegion::new(
                         self.device.bars[usize::from(bar)].address + u64::from(offset),
                         u64::from(length),
                     );
+                    trace!("VirtioPciTransport::init: common config region set");
                 }
 
                 if cfg_type == VirtioPciCapabilityType::NotifyConfig as u8 {
@@ -477,6 +534,7 @@ impl VirtioTransport for VirtioPciTransport {
                     //         le32 notify_off_multiplier; /* Multiplier for queue_notify_off. */
                     // };
                     self.notify_off_multiplier = self.device.read_u32(cap_next + 16);
+                    trace!("VirtioPciTransport::init: notify config region set");
                 }
 
                 if cfg_type == VirtioPciCapabilityType::DeviceConfig as u8 {
@@ -484,22 +542,29 @@ impl VirtioTransport for VirtioPciTransport {
                         self.device.bars[usize::from(bar)].address + u64::from(offset),
                         u64::from(length),
                     );
+                    trace!("VirtioPciTransport::init: device config region set");
                 }
             }
             cap_next = self.device.read_u8(cap_next + 1)
         }
 
+        trace!("VirtioPciTransport::init: done");
         Ok(())
     }
 
     fn get_status(&self) -> u32 {
+        trace!("VirtioPciTransport::get_status: start");
         // device_status: 0x14
-        u32::from(self.region.io_read_u8(0x14))
+        let value = u32::from(self.region.io_read_u8(0x14));
+        trace!("VirtioPciTransport::get_status: value=0x{:x}", value);
+        value
     }
 
     fn set_status(&self, value: u32) {
+        trace!("VirtioPciTransport::set_status: value=0x{:x}", value);
         // device_status: 0x14
         self.region.io_write_u8(0x14, value as u8);
+        trace!("VirtioPciTransport::set_status: done");
     }
 
     fn add_status(&self, value: u32) {
@@ -511,6 +576,7 @@ impl VirtioTransport for VirtioPciTransport {
     }
 
     fn get_features(&self) -> u64 {
+        trace!("VirtioPciTransport::get_features: start");
         // device_feature_select: 0x00
         self.region.io_write_u32(0x00, 0);
         // device_feature: 0x04
@@ -519,6 +585,7 @@ impl VirtioTransport for VirtioPciTransport {
         self.region.io_write_u32(0x00, 1);
         // device_feature: 0x04
         device_features |= u64::from(self.region.io_read_u32(0x04)) << 32;
+        trace!("VirtioPciTransport::get_features: value=0x{:x}", device_features);
 
         device_features
     }

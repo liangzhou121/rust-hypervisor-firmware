@@ -3,6 +3,9 @@
 
 #![allow(dead_code)]
 
+#[cfg(feature = "td-shim")]
+use log::trace;
+
 #[derive(Default)]
 /// Provides a checked way to access memory offsets from a range of raw memory
 pub struct MemoryRegion {
@@ -100,8 +103,21 @@ impl MemoryRegion {
         T: Copy + Sized,
     {
         assert!((offset + (core::mem::size_of::<T>() - 1) as u64) < self.length);
-        let ptr: *const T = core::ptr::with_exposed_provenance((self.base + offset) as usize);
-        unsafe { ptr.read_volatile() }
+        // MMIO regions (e.g. PCI BARs) live in shared, not private, guest
+        // memory inside a TDX guest; a plain load traps fatally, so ask the
+        // host to perform the access instead.
+        #[cfg(feature = "td-shim")]
+        {
+            trace!("MemoryRegion::io_read: addr=0x{:x} size={}", self.base + offset, core::mem::size_of::<T>());
+            let value = tdx_tdcall::tdx::tdvmcall_mmio_read((self.base + offset) as usize);
+            trace!("MemoryRegion::io_read: addr=0x{:x} done", self.base + offset);
+            value
+        }
+        #[cfg(not(feature = "td-shim"))]
+        {
+            let ptr: *const T = core::ptr::with_exposed_provenance((self.base + offset) as usize);
+            unsafe { ptr.read_volatile() }
+        }
     }
 
     /// Read a single byte at given offset with a mechanism suitable for MMIO
@@ -130,8 +146,17 @@ impl MemoryRegion {
         T: Sized,
     {
         assert!((offset + (core::mem::size_of::<T>() - 1) as u64) < self.length);
-        let ptr: *mut T = core::ptr::with_exposed_provenance_mut((self.base + offset) as usize);
-        unsafe { core::ptr::write_volatile(ptr, value) }
+        #[cfg(feature = "td-shim")]
+        {
+            trace!("MemoryRegion::io_write: addr=0x{:x} size={}", self.base + offset, core::mem::size_of::<T>());
+            tdx_tdcall::tdx::tdvmcall_mmio_write((self.base + offset) as *const T, value);
+            trace!("MemoryRegion::io_write: addr=0x{:x} done", self.base + offset);
+        }
+        #[cfg(not(feature = "td-shim"))]
+        {
+            let ptr: *mut T = core::ptr::with_exposed_provenance_mut((self.base + offset) as usize);
+            unsafe { core::ptr::write_volatile(ptr, value) }
+        }
     }
 
     /// Write a single byte at given offset with a mechanism suitable for MMIO

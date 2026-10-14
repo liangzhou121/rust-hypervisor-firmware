@@ -5,7 +5,7 @@ pub struct Logger;
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Trace
     }
 
     fn log(&self, record: &log::Record) {
@@ -19,5 +19,5 @@ impl log::Log for Logger {
 
 pub fn init() {
     log::set_logger(&Logger).expect("Failed to set logger");
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Trace);
 }

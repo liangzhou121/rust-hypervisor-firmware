@@ -27,9 +27,18 @@ pub extern "efiapi" fn stdin_reset(_: *mut SimpleTextInputProtocol, _: Boolean) 
 
 pub extern "efiapi" fn stdin_read_key_stroke(
     _: *mut SimpleTextInputProtocol,
-    _: *mut InputKey,
+    key: *mut InputKey,
 ) -> Status {
-    Status::NOT_READY
+    match crate::serial::read_byte() {
+        Some(b) => {
+            unsafe {
+                (*key).scan_code = 0;
+                (*key).unicode_char = b as Char16;
+            }
+            Status::SUCCESS
+        }
+        None => Status::NOT_READY,
+    }
 }
 
 pub extern "efiapi" fn stdout_reset(_: *mut SimpleTextOutputProtocol, _: Boolean) -> Status {

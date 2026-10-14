@@ -65,3 +65,104 @@ pub fn setup() {
 fn phys_addr<T>(virt_addr: *const T) -> PhysAddr {
     PhysAddr::new(virt_addr as u64)
 }
+
+// TDX guests must mark DMA-visible memory (e.g. virtio rings/buffers) as
+// "shared" so the host-side device backend can access it; private memory is
+// encrypted and invisible to the host. This splits our 2 MiB identity-mapped
+// huge pages down to 4 KiB granularity as needed to flip that bit precisely.
+#[cfg(feature = "td-shim")]
+mod shared {
+    use super::{phys_addr, L2_TABLES};
+    use x86_64::{
+        structures::paging::{
+            page_table::PageTableEntry, PageSize, PageTable, PageTableFlags, Size1GiB, Size2MiB,
+            Size4KiB,
+        },
+        PhysAddr,
+    };
+
+    // At most one 2 MiB region needs splitting for our (sub-page-sized)
+    // shared virtio I/O buffer; keep a small margin regardless.
+    const MAX_SPLITS: usize = 2;
+    const EMPTY_TABLE: PageTable = PageTable::new();
+    static SPLIT_TABLES: core::cell::SyncUnsafeCell<[PageTable; MAX_SPLITS]> =
+        core::cell::SyncUnsafeCell::new([EMPTY_TABLE; MAX_SPLITS]);
+    static mut SPLIT_COUNT: usize = 0;
+
+    fn l2_entry(addr: u64) -> &'static mut PageTableEntry {
+        // SAFETY: `paging::setup()` has already run, and this is boot-time,
+        // single-threaded code.
+        let l2s = unsafe { &mut *L2_TABLES.get() };
+        let gib = (addr / Size1GiB::SIZE) as usize;
+        let index = ((addr % Size1GiB::SIZE) / Size2MiB::SIZE) as usize;
+        &mut l2s[gib][index]
+    }
+
+    // Splits the 2 MiB mapping covering `addr` into a 4 KiB-granularity page
+    // table (if not done already) and returns it.
+    fn split_2mib(addr: u64) -> &'static mut PageTable {
+        let region_base = addr & !(Size2MiB::SIZE - 1);
+        let entry = l2_entry(region_base);
+
+        if !entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // SAFETY: only ever points at one of our own SPLIT_TABLES entries.
+            return unsafe { &mut *(entry.addr().as_u64() as *mut PageTable) };
+        }
+
+        let flags = entry.flags() & !PageTableFlags::HUGE_PAGE;
+        let frame_base = entry.addr().as_u64();
+
+        // SAFETY: boot-time only, single-threaded.
+        let table = unsafe {
+            let index = SPLIT_COUNT;
+            assert!(index < MAX_SPLITS, "Out of page-table split slots");
+            SPLIT_COUNT = index + 1;
+            &mut (*SPLIT_TABLES.get())[index]
+        };
+        for (i, l1e) in table.iter_mut().enumerate() {
+            l1e.set_addr(
+                PhysAddr::new(frame_base + (i as u64) * Size4KiB::SIZE),
+                flags,
+            );
+        }
+
+        entry.set_addr(phys_addr(table), flags);
+        table
+    }
+
+    fn toggle_shared_bit(addr: u64, length: usize, shared: bool) {
+        assert_eq!(addr % Size4KiB::SIZE, 0, "address must be 4 KiB aligned");
+        assert_eq!(
+            length as u64 % Size4KiB::SIZE,
+            0,
+            "length must be 4 KiB aligned"
+        );
+
+        let shared_mask =
+            tdx_tdcall::tdx::td_shared_mask().expect("Failed to get the TD shared GPA mask");
+
+        let mut page = addr;
+        let end = addr + length as u64;
+        while page < end {
+            let table = split_2mib(page);
+            let index = ((page % Size2MiB::SIZE) / Size4KiB::SIZE) as usize;
+            let entry = &mut table[index];
+            let flags = entry.flags();
+            let phys = entry.addr().as_u64() & !shared_mask;
+            let new_phys = if shared { phys | shared_mask } else { phys };
+            entry.set_addr(PhysAddr::new(new_phys), flags);
+            page += Size4KiB::SIZE;
+        }
+
+        x86_64::instructions::tlb::flush_all();
+    }
+
+    /// Marks `[addr, addr + length)` as TDX shared (unencrypted) memory.
+    /// `addr` and `length` must be 4 KiB aligned.
+    pub fn set_shared_bit(addr: u64, length: usize) {
+        toggle_shared_bit(addr, length, true)
+    }
+}
+
+#[cfg(feature = "td-shim")]
+pub use shared::set_shared_bit;
