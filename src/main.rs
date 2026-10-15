@@ -350,13 +350,6 @@ extern "C" fn tdshim_start(hob_address: u64) -> ! {
     // TDVMCALL instead of just trapping.
     td_exception::setup_exception_handlers();
 
-    // GRUB/Linux both have fallback delay/calibration loops that busy-poll
-    // the (here, non-functional) legacy PIT, bounded only by a background
-    // timer tick; without any interrupt source at all those loops never
-    // give up. Give them a real periodic LAPIC timer, like real firmware
-    // (e.g. OVMF's LocalApicTimerDxe) provides from early boot onward.
-    arch::x86_64::apic::setup_periodic_timer();
-
     // Safety: td-shim passes a valid HOB list address in RDI.
     let info = unsafe { tdshim::StartInfo::new(hob_address) };
 

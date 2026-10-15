@@ -212,18 +212,26 @@ pub extern "efiapi" fn check_event(_: Event) -> Status {
     Status::UNSUPPORTED
 }
 
+const SHIM_LOCK_PROTOCOL_GUID: Guid = Guid::from_fields(
+    0x605d_ab50,
+    0xe046,
+    0x4300,
+    0xab,
+    0xb6,
+    &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+);
+
 pub extern "efiapi" fn install_protocol_interface(
     _: *mut Handle,
-    _: *mut Guid,
+    guid: *mut Guid,
     _: InterfaceType,
     _: *mut c_void,
 ) -> Status {
-    // Accept installs for any protocol GUID rather than just our hardcoded
-    // shim lock one: callers like GRUB's secure-boot hook treat failure here
-    // as fatal (printing "failed to install protocols" and prompting for a
-    // keypress we have no reliable way to satisfy), even though it's really
-    // an optional enhancement they can safely proceed without.
-    Status::SUCCESS
+   if unsafe { *guid } == SHIM_LOCK_PROTOCOL_GUID {
+        Status::SUCCESS
+    } else {
+        Status::UNSUPPORTED
+    }
 }
 
 pub extern "efiapi" fn reinstall_protocol_interface(
@@ -232,8 +240,7 @@ pub extern "efiapi" fn reinstall_protocol_interface(
     _: *mut c_void,
     _: *mut c_void,
 ) -> Status {
-    // See install_protocol_interface() above.
-    Status::SUCCESS
+    Status::NOT_FOUND
 }
 
 pub extern "efiapi" fn uninstall_protocol_interface(
@@ -293,11 +300,7 @@ pub extern "efiapi" fn locate_handle(
         return Status::SUCCESS;
     }
 
-    // Returning EFI_UNSUPPORTED here (as this used to do) breaks callers
-    // that use LocateHandle() to probe for an optional protocol (e.g. shim
-    // checking for a TPM): they expect EFI_NOT_FOUND specifically to mean
-    // "no handles support this protocol" and treat anything else as fatal.
-    Status::NOT_FOUND
+    Status::UNSUPPORTED
 }
 
 pub extern "efiapi" fn locate_device_path(
@@ -577,8 +580,7 @@ pub extern "efiapi" fn locate_handle_buffer(
     _: *mut usize,
     _: *mut *mut Handle,
 ) -> Status {
-    // See locate_handle() above for why this is NOT_FOUND, not UNSUPPORTED.
-    Status::NOT_FOUND
+     Status::UNSUPPORTED
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -610,75 +612,6 @@ pub const RISV_V_BOOT_PROTOCOL_GUID: Guid = Guid::from_fields(
     &[0x3e, 0x69, 0xe4, 0xb9, 0x40, 0xbf],
 );
 
-// RDRAND is a plain CPU instruction (not a privileged/IO operation), so it
-// works natively inside a TDX guest without any TDVMCALL/#VE involvement.
-#[cfg(target_arch = "x86_64")]
-fn rdrand64() -> u64 {
-    loop {
-        let val: u64;
-        let ok: u8;
-        unsafe {
-            core::arch::asm!(
-                "rdrand {val}",
-                "setc {ok}",
-                val = out(reg) val,
-                ok = out(reg_byte) ok,
-            );
-        }
-        if ok != 0 {
-            return val;
-        }
-        core::hint::spin_loop();
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-pub extern "efiapi" fn rng_get_info(
-    _this: *mut r_efi::protocols::rng::Protocol,
-    algorithm_list_size: *mut usize,
-    algorithm_list: *mut r_efi::protocols::rng::Algorithm,
-) -> Status {
-    unsafe {
-        if *algorithm_list_size < size_of::<r_efi::protocols::rng::Algorithm>() {
-            *algorithm_list_size = size_of::<r_efi::protocols::rng::Algorithm>();
-            return Status::BUFFER_TOO_SMALL;
-        }
-        *algorithm_list_size = size_of::<r_efi::protocols::rng::Algorithm>();
-        *algorithm_list = r_efi::protocols::rng::ALGORITHM_RAW;
-    }
-    Status::SUCCESS
-}
-
-#[cfg(target_arch = "x86_64")]
-pub extern "efiapi" fn rng_get_rng(
-    _this: *mut r_efi::protocols::rng::Protocol,
-    _algorithm: *mut r_efi::protocols::rng::Algorithm,
-    length: usize,
-    value: *mut u8,
-) -> Status {
-    if value.is_null() || length == 0 {
-        return Status::INVALID_PARAMETER;
-    }
-    let mut remaining = length;
-    let mut ptr = value;
-    while remaining > 0 {
-        let bytes = rdrand64().to_ne_bytes();
-        let n = remaining.min(bytes.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, n);
-            ptr = ptr.add(n);
-        }
-        remaining -= n;
-    }
-    Status::SUCCESS
-}
-
-#[cfg(target_arch = "x86_64")]
-pub static RNG_PROTOCOL: r_efi::protocols::rng::Protocol = r_efi::protocols::rng::Protocol {
-    get_info: rng_get_info,
-    get_rng: rng_get_rng,
-};
-
 pub extern "efiapi" fn locate_protocol(
     _guid: *mut Guid,
     _: *mut c_void,
@@ -687,11 +620,6 @@ pub extern "efiapi" fn locate_protocol(
     #[cfg(target_arch = "riscv64")]
     if unsafe { *_guid } == RISV_V_BOOT_PROTOCOL_GUID {
         unsafe { *_out = &RISC_V_BOOT_PROTOCOL as *const RiscVBootProtocol as *mut c_void };
-        return Status::SUCCESS;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if unsafe { *_guid } == r_efi::protocols::rng::PROTOCOL_GUID {
-        unsafe { *_out = &RNG_PROTOCOL as *const r_efi::protocols::rng::Protocol as *mut c_void };
         return Status::SUCCESS;
     }
     // XXX: A recent version of Linux kernel fails to boot if EFI_UNSUPPORTED returned.
@@ -703,11 +631,7 @@ pub extern "efiapi" fn install_multiple_protocol_interfaces(
     _: *mut c_void,
     _: *mut c_void,
 ) -> Status {
-    // Same reasoning as install_protocol_interface() above: GRUB's variadic
-    // "install multiple protocols" call (e.g. for a loaded image's device
-    // path) is the actual source of "error: failed to install protocols."
-    // when it was rejected outright.
-    Status::SUCCESS
+    Status::UNSUPPORTED
 }
 
 pub extern "efiapi" fn uninstall_multiple_protocol_interfaces(
@@ -715,7 +639,7 @@ pub extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     _: *mut c_void,
     _: *mut c_void,
 ) -> Status {
-    Status::SUCCESS
+    Status::UNSUPPORTED
 }
 
 pub extern "efiapi" fn calculate_crc32(_: *mut c_void, _: usize, _: *mut u32) -> Status {
